@@ -2,7 +2,7 @@
 
 Este documento contém todos os comandos para testar e verificar o funcionamento dos deployments de banco de dados.
 
-## 🐘 PostgreSQL - Testes de Replicação
+## 🐘 PostgreSQL - Testes de Replicação Primary-Replica
 
 ### 1. Deploy e Verificação Inicial
 ```bash
@@ -19,28 +19,28 @@ kubectl get svc -l app=postgres
 
 ### 2. Verificar Configuração de Replicação
 ```bash
-# Status de replicação no master
+# Status de replicação no primary
 kubectl exec postgres-0 -- psql -U postgres -c "SELECT client_addr, state, sync_state FROM pg_stat_replication;"
 
-# Verificar se slaves estão em recovery mode
+# Verificar se replicas estão em recovery mode
 kubectl exec postgres-1 -- psql -U postgres -c "SELECT pg_is_in_recovery();"
 kubectl exec postgres-2 -- psql -U postgres -c "SELECT pg_is_in_recovery();"
 
-# Verificar configuração do wal receiver nos slaves
+# Verificar configuração do wal receiver nas replicas
 kubectl exec postgres-1 -- psql -U postgres -c "SELECT status, received_lsn FROM pg_stat_wal_receiver;"
 ```
 
 ### 3. Teste de Replicação de Dados
 ```bash
-# Criar banco e tabela no master
+# Criar banco e tabela no primary
 kubectl exec postgres-0 -- psql -U postgres -c "
 CREATE DATABASE testdb;
 \c testdb;
 CREATE TABLE users (id SERIAL PRIMARY KEY, name VARCHAR(100), created_at TIMESTAMP DEFAULT NOW());
-INSERT INTO users (name) VALUES ('Usuario Master'), ('Teste Replicacao');
+INSERT INTO users (name) VALUES ('Usuario Primary'), ('Teste Replicacao');
 "
 
-# Verificar dados nos slaves (aguardar alguns segundos)
+# Verificar dados nas replicas (aguardar alguns segundos)
 sleep 10
 
 kubectl exec postgres-1 -- psql -U postgres -d testdb -c "SELECT * FROM users;"
@@ -49,7 +49,7 @@ kubectl exec postgres-2 -- psql -U postgres -d testdb -c "SELECT * FROM users;"
 
 ### 4. Teste de Failover Manual
 ```bash
-# Simular falha do master (deletar pod)
+# Simular falha do primary (deletar pod)
 kubectl delete pod postgres-0
 
 # Aguardar restart automático
@@ -172,9 +172,107 @@ print('Count on secondary:', db.loadtest.countDocuments());
 "
 ```
 
+### MySQL Debug
+```bash
+# Logs detalhados
+kubectl logs mysql-0 --tail=100
+kubectl logs mysql-1 --tail=100
+
+# Verificar configuração do MySQL
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW VARIABLES LIKE '%server_id%';"
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW VARIABLES LIKE '%log_bin%';"
+
+# Verificar status detalhado das replicas
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G"
+
+# Verificar posição dos logs
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW MASTER STATUS;"
+
+# Verificar conexões de replicação
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW PROCESSLIST;" | grep repl
+
+# Forçar reconexão se necessário
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "STOP REPLICA; START REPLICA;"
+```
+
 ---
 
-## 🔧 Comandos de Troubleshooting
+## � MySQL - Testes de Replicação Primary-Replica
+
+### 1. Deploy e Verificação Inicial
+```bash
+# Deploy
+kubectl apply -f 3.yaml
+
+# Aguardar pods subirem
+kubectl wait --for=condition=ready pod -l app=mysql --timeout=300s
+
+# Verificar status
+kubectl get pods -l app=mysql
+kubectl get svc -l app=mysql
+```
+
+### 2. Verificar Configuração de Replicação
+```bash
+# Status de replicação no primary
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW MASTER STATUS;"
+
+# Verificar se replicas estão configuradas
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running)"
+kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running)"
+
+# Verificar usuário de replicação
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SELECT User, Host FROM mysql.user WHERE User='repl';"
+```
+
+### 3. Teste de Replicação de Dados
+```bash
+# Inserir dados no primary
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "
+CREATE DATABASE testdb;
+USE testdb;
+CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(100), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+INSERT INTO users (name) VALUES ('Usuario Primary'), ('Teste Replicacao');
+"
+
+# Verificar dados nas replicas (aguardar alguns segundos)
+sleep 10
+
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "USE testdb; SELECT * FROM users;"
+kubectl exec mysql-2 -- mysql -u root -prootpass -e "USE testdb; SELECT * FROM users;"
+```
+
+### 4. Teste de Failover Manual
+```bash
+# Simular falha do primary (deletar pod)
+kubectl delete pod mysql-0
+
+# Aguardar restart automático
+kubectl wait --for=condition=ready pod mysql-0 --timeout=300s
+
+# Verificar se replicação continua funcionando
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "USE testdb; INSERT INTO users (name) VALUES ('Pos Failover');"
+sleep 5
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "USE testdb; SELECT * FROM users WHERE name = 'Pos Failover';"
+```
+
+### 5. Teste de Carga Simples
+```bash
+# Inserir muitos registros no primary
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "
+USE testdb;
+CREATE TABLE loadtest (id INT PRIMARY KEY AUTO_INCREMENT, data VARCHAR(255), timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+"
+
+for i in {1..1000}; do
+  kubectl exec mysql-0 -- mysql -u root -prootpass -e "USE testdb; INSERT INTO loadtest (data) VALUES ('Load test data $i');"
+done
+
+# Verificar replicação nas replicas
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "USE testdb; SELECT COUNT(*) as total FROM loadtest;"
+```
+
+
 
 ### PostgreSQL Debug
 ```bash
@@ -188,7 +286,7 @@ kubectl exec postgres-0 -- cat /var/lib/postgresql/data/postgresql.conf | grep -
 # Verificar pg_hba.conf
 kubectl exec postgres-0 -- cat /var/lib/postgresql/data/pg_hba.conf
 
-# Verificar recovery.conf nos slaves
+# Verificar recovery.conf nas replicas
 kubectl exec postgres-1 -- cat /var/lib/postgresql/data/postgresql.auto.conf
 
 # Status de conexões
@@ -238,9 +336,22 @@ echo "Pods:"
 kubectl get pods -l app=postgres
 echo -e "\nReplication Status:"
 kubectl exec postgres-0 -- psql -U postgres -c "SELECT client_addr, state, sync_state FROM pg_stat_replication;"
-echo -e "\nSlave Status:"
+echo -e "\nReplica Status:"
 kubectl exec postgres-1 -- psql -U postgres -c "SELECT pg_is_in_recovery();"
 kubectl exec postgres-2 -- psql -U postgres -c "SELECT pg_is_in_recovery();"
+```
+
+### Script de Verificação MySQL
+```bash
+#!/bin/bash
+echo "=== MySQL Replica Set Status ==="
+echo "Pods:"
+kubectl get pods -l app=mysql
+echo -e "\nPrimary Status:"
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW MASTER STATUS;"
+echo -e "\nReplica Status:"
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running)"
+kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running)"
 ```
 
 ### Script de Verificação MongoDB
@@ -263,10 +374,12 @@ rs.status().members.forEach(function(member) {
 echo "Removendo todos os recursos..."
 kubectl delete -f postgres.yaml 2>/dev/null || true
 kubectl delete -f mongodb.yaml 2>/dev/null || true
+kubectl delete -f 3.yaml 2>/dev/null || true
 kubectl delete job mongodb-init-replica 2>/dev/null || true
 echo "Aguardando pods terminarem..."
 kubectl wait --for=delete pod -l app=postgres --timeout=120s 2>/dev/null || true
 kubectl wait --for=delete pod -l app=mongodb --timeout=120s 2>/dev/null || true
+kubectl wait --for=delete pod -l app=mysql --timeout=120s 2>/dev/null || true
 echo "Limpeza concluída!"
 ```
 
@@ -310,6 +423,39 @@ const startTime = new Date();
 const count = db.perftest.countDocuments();
 const endTime = new Date();
 print('Count: ' + count + ', Time: ' + (endTime - startTime) + 'ms');
+"
+```
+
+### MySQL - Teste de Performance
+```bash
+# Criar banco para benchmarks
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "CREATE DATABASE benchdb;"
+
+# Criar tabela de teste
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "
+USE benchdb;
+CREATE TABLE perftest (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  data VARCHAR(255),
+  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"
+
+# Inserir dados em lote
+for i in {1..10000}; do
+  kubectl exec mysql-0 -- mysql -u root -prootpass -e "USE benchdb; INSERT INTO perftest (data) VALUES ('Performance test data $i');"
+  if [ $((i % 1000)) -eq 0 ]; then
+    echo "Inserted $i records..."
+  fi
+done
+
+# Teste de leitura na replica
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "
+USE benchdb;
+SET @start_time = NOW(6);
+SELECT COUNT(*) as total FROM perftest;
+SET @end_time = NOW(6);
+SELECT TIMESTAMPDIFF(MICROSECOND, @start_time, @end_time) as execution_time_microseconds;
 "
 ```
 
