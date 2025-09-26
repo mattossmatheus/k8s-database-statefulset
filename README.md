@@ -276,19 +276,6 @@ kubectl exec mysql-0 -- mysql -u root -prootpass -e "SELECT User, Host FROM mysq
 
 ---
 
-## 📊 Monitoramento
-
-### Verificações Básicas
-```bash
-# Status geral
-kubectl get pods,svc,pvc
-
-# Recursos
-kubectl top pods
-
-# Logs em tempo real
-kubectl logs -f <pod-name>
-```
 
 ### Testes de Replicação
 
@@ -322,17 +309,4 @@ kubectl exec mysql-2 -- mysql -u root -prootpass -e "USE testdb; SELECT * FROM t
 
 ---
 
-## 🤝 Contribuindo
 
-1. Fork este repositório
-2. Crie uma branch para sua feature (`git checkout -b feature/AmazingFeature`)
-3. Commit suas mudanças (`git commit -m 'Add some AmazingFeature'`)
-4. Push para a branch (`git push origin feature/AmazingFeature`)
-5. Abra um Pull Request
-
----
-
-
----
-
-**Desenvolvido com ❤️ para a comunidade Kubernetes**
