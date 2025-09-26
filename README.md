@@ -4,12 +4,7 @@ Deployments completos de bancos de dados com **replicação read/write** usando 
 
 ## 📋 Bancos de Dados Disponíveis
 
-| Banco | Status | Au# Status de replicação no primary
-kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW MASTER STATUS;"
-
-# Verificar status das replicas
-kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"
-kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"o | Arquitetura |
+| Banco | Status | Automação | Arquitetura |
 |-------|--------|-----------|-------------|
 | PostgreSQL 15 | ✅ Pronto | 100% Automático | 1 Primary + 2 Replicas (Read/Write) |
 | MongoDB 7.0 | ✅ Pronto | Automático* | 1 Primary + 2 Secondary (Replica Set) |
@@ -251,12 +246,12 @@ kubectl exec mongodb-0 -- mongosh --eval "rs.reconfig({_id:'rs0', members:[{_id:
 # Verificar logs
 kubectl logs mysql-0
 
-# Verificar status de replicação no master
+# Status de replicação no primary
 kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW MASTER STATUS;"
 
-# Verificar status dos slaves
-kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW SLAVE STATUS\G" | grep -E "(Slave_IO_Running|Slave_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"
-kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW SLAVE STATUS\G" | grep -E "(Slave_IO_Running|Slave_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"
+# Verificar status das replicas
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"
+kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"
 
 # Verificar usuário de replicação
 kubectl exec mysql-0 -- mysql -u root -prootpass -e "SELECT User, Host FROM mysql.user WHERE User='repl';"
