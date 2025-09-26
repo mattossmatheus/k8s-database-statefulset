@@ -1,20 +1,25 @@
 # 🚀 Kubernetes StatefulSet Database Deployments
 
-Deployments completos de bancos de dados master-slave usando **StatefulSet** em clusters **K3s**, com configuração automática de replicação.
+Deployments completos de bancos de dados com **replicação read/write** usando **StatefulSet** em clusters **K3s**, com configuração automática de replicação.
 
 ## 📋 Bancos de Dados Disponíveis
 
-| Banco | Status | Automação | Replicação |
-|-------|--------|-----------|------------|
-| PostgreSQL 15 | ✅ Pronto | 100% Automático | Streaming Replication |
-| MongoDB 7.0 | ✅ Pronto | Automático* | Replica Set |
-| MySQL 8.0 | ✅ Pronto | 100% Automático | Binary Log Replication |
+| Banco | Status | Au# Status de replicação no primary
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW MASTER STATUS;"
 
-## 🐘 PostgreSQL Master-Slave
+# Verificar status das replicas
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"
+kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G" | grep -E "(Replica_IO_Running|Replica_SQL_Running|Master_Log_File|Read_Master_Log_Pos)"o | Arquitetura |
+|-------|--------|-----------|-------------|
+| PostgreSQL 15 | ✅ Pronto | 100% Automático | 1 Primary + 2 Replicas (Read/Write) |
+| MongoDB 7.0 | ✅ Pronto | Automático* | 1 Primary + 2 Secondary (Replica Set) |
+| MySQL 8.0 | ✅ Pronto | 100% Automático | 1 Primary + 2 Replicas (Read/Write) |
+
+## 🐘 PostgreSQL Primary-Replica
 
 ### Características
 - **Versão**: PostgreSQL 15
-- **Arquitetura**: 1 Master + 2 Slaves
+- **Arquitetura**: 1 Primary + 2 Replicas (Read/Write)
 - **Replicação**: Streaming Replication (automática)
 - **Storage**: Local-path (K3s)
 - **Automação**: 100% automática
@@ -26,10 +31,10 @@ kubectl apply -f postgres.yaml
 
 ### Estrutura do Cluster
 ```
-postgres-0 (MASTER)     ← Escritas
+postgres-0 (PRIMARY)    ← Escritas (Write)
     ↓
-postgres-1 (SLAVE)      ← Leituras
-postgres-2 (SLAVE)      ← Leituras
+postgres-1 (REPLICA)    ← Leituras (Read)
+postgres-2 (REPLICA)    ← Leituras (Read)
 ```
 
 ### Serviços
@@ -39,19 +44,19 @@ postgres-2 (SLAVE)      ← Leituras
 
 ### Conexão
 ```bash
-# Escrita (Master)
+# Escrita (Primary)
 kubectl exec -it postgres-0 -- psql -U postgres
 
-# Leitura (Slaves)
+# Leitura (Replicas)
 kubectl exec -it postgres-1 -- psql -U postgres
 ```
 
 ### Verificação
 ```bash
-# Status de replicação
+# Status de replicação no primary
 kubectl exec postgres-0 -- psql -U postgres -c "SELECT * FROM pg_stat_replication;"
 
-# Verificar dados replicados
+# Verificar dados replicados nas replicas
 kubectl exec postgres-1 -- psql -U postgres -c "SELECT * FROM pg_stat_wal_receiver;"
 ```
 
@@ -112,50 +117,50 @@ kubectl exec mongodb-1 -- mongosh testdb --eval "db.getMongo().setReadPref('seco
 
 ---
 
-## 🐬 MySQL Master-Slave
+## 🐬 MySQL Primary-Replica
 
 ### Características
 - **Versão**: MySQL 8.0
-- **Arquitetura**: 1 Master + 2 Slaves
+- **Arquitetura**: 1 Primary + 2 Replicas (Read/Write)
 - **Replicação**: Binary Log Replication (automática)
 - **Storage**: Local-path (K3s)
 - **Automação**: 100% automática
 
 ### Deploy
 ```bash
-kubectl apply -f mysql.yaml
+kubectl apply -f 3.yaml
 ```
 
 ### Estrutura do Cluster
 ```
-mysql-0 (MASTER)      ← Escritas
+mysql-0 (PRIMARY)     ← Escritas (Write)
     ↓
-mysql-1 (SLAVE)       ← Leituras
-mysql-2 (SLAVE)       ← Leituras
+mysql-1 (REPLICA)     ← Leituras (Read)
+mysql-2 (REPLICA)     ← Leituras (Read)
 ```
 
 ### Serviços
-- **mysql-master**: Conexões de escrita → `mysql-0`
-- **mysql-slave**: Conexões de leitura → `mysql-1,mysql-2`
+- **mysql-master**: Conexões de escrita (write) → `mysql-0`
+- **mysql-slave**: Conexões de leitura (read) → `mysql-1,mysql-2`
 - **mysql-headless**: Descoberta interna dos pods
 
 ### Conexão
 ```bash
-# Escrita (Master)
+# Escrita (Primary)
 kubectl exec -it mysql-0 -- mysql -u root -p
 
-# Leitura (Slaves)
+# Leitura (Replicas)
 kubectl exec -it mysql-1 -- mysql -u root -p
 ```
 
 ### Verificação
 ```bash
-# Status de replicação no master
+# Status de replicação no primary
 kubectl exec mysql-0 -- mysql -u root -prootpass -e "SHOW MASTER STATUS;"
 
-# Status dos slaves
-kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW SLAVE STATUS\G"
-kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW SLAVE STATUS\G"
+# Status das replicas
+kubectl exec mysql-1 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G"
+kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW REPLICA STATUS\G"
 ```
 
 ---
@@ -166,9 +171,9 @@ kubectl exec mysql-2 -- mysql -u root -prootpass -e "SHOW SLAVE STATUS\G"
 ```
 postgres.yaml           # StatefulSet completo com automação
 ├── ConfigMap          # Scripts de inicialização
-├── StatefulSet        # 3 replicas (1 master + 2 slaves)
+├── StatefulSet        # 3 replicas (1 primary + 2 replicas)
 ├── Services           # Primary, Replicas, Headless
-└── Automação         # Detecção automática de role (master/slave)
+└── Automação         # Detecção automática de role (primary/replica)
 ```
 
 ### MongoDB
@@ -184,10 +189,10 @@ deploy-mongodb.sh       # Script de deploy completo
 
 ### MySQL
 ```
-mysql.yaml                  # StatefulSet completo com automação
+3.yaml                  # StatefulSet completo com automação
 ├── ConfigMap          # Scripts de inicialização e replicação
-├── StatefulSet        # 3 replicas (1 master + 2 slaves)
-├── Services           # Master, Slave, Headless
+├── StatefulSet        # 3 replicas (1 primary + 2 replicas)
+├── Services           # Primary, Replica, Headless
 └── Automação         # Configuração automática de Binary Log Replication
 ```
 
@@ -222,7 +227,7 @@ kubectl logs postgres-0
 # Verificar status de replicação
 kubectl exec postgres-0 -- psql -U postgres -c "\x" -c "SELECT * FROM pg_stat_replication;"
 
-# Verificar se slave está recebendo dados
+# Verificar se replica está recebendo dados
 kubectl exec postgres-1 -- psql -U postgres -c "SELECT pg_is_in_recovery();"
 ```
 
@@ -276,14 +281,28 @@ kubectl exec mysql-0 -- mysql -u root -prootpass -e "SELECT User, Host FROM mysq
 
 ---
 
+## 📊 Monitoramento
+
+### Verificações Básicas
+```bash
+# Status geral
+kubectl get pods,svc,pvc
+
+# Recursos
+kubectl top pods
+
+# Logs em tempo real
+kubectl logs -f <pod-name>
+```
+
 ### Testes de Replicação
 
 #### PostgreSQL
 ```bash
-# Inserir no master
-kubectl exec postgres-0 -- psql -U postgres -c "CREATE TABLE test (id INT, msg TEXT); INSERT INTO test VALUES (1, 'Hello from master');"
+# Inserir no primary (write)
+kubectl exec postgres-0 -- psql -U postgres -c "CREATE TABLE test (id INT, msg TEXT); INSERT INTO test VALUES (1, 'Hello from primary');"
 
-# Verificar no slave
+# Verificar na replica (read)
 kubectl exec postgres-1 -- psql -U postgres -c "SELECT * FROM test;"
 ```
 
@@ -298,10 +317,10 @@ kubectl exec mongodb-1 -- mongosh testdb --eval "db.getMongo().setReadPref('seco
 
 #### MySQL
 ```bash
-# Inserir no master
-kubectl exec mysql-0 -- mysql -u root -prootpass -e "CREATE DATABASE testdb; USE testdb; CREATE TABLE test (id INT PRIMARY KEY, msg VARCHAR(100)); INSERT INTO test VALUES (1, 'Hello from master');"
+# Inserir no primary (write)
+kubectl exec mysql-0 -- mysql -u root -prootpass -e "CREATE DATABASE testdb; USE testdb; CREATE TABLE test (id INT PRIMARY KEY, msg VARCHAR(100)); INSERT INTO test VALUES (1, 'Hello from primary');"
 
-# Verificar nos slaves
+# Verificar nas replicas (read)
 kubectl exec mysql-1 -- mysql -u root -prootpass -e "USE testdb; SELECT * FROM test;"
 kubectl exec mysql-2 -- mysql -u root -prootpass -e "USE testdb; SELECT * FROM test;"
 ```
@@ -318,11 +337,7 @@ kubectl exec mysql-2 -- mysql -u root -prootpass -e "USE testdb; SELECT * FROM t
 
 ---
 
-## 📝 Licença
-
-Este projeto está sob a licença MIT. Veja o arquivo `LICENSE` para detalhes.
 
 ---
-
 
 **Desenvolvido com ❤️ para a comunidade Kubernetes**
