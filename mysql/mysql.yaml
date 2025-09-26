@@ -1,0 +1,196 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-scripts
+data:
+  init-mysql.sh: |
+    #!/bin/sh
+    echo "Iniciando initContainer em $HOSTNAME"
+    mkdir -p /mnt/conf /mnt/initdb
+
+    if [ "$(hostname)" = "mysql-0" ]; then
+      echo "MASTER" > /mnt/conf/role
+      cat <<EOF > /mnt/conf/master.cnf
+    [mysqld]
+    server-id=1
+    log-bin=mysql-bin
+    binlog-format=ROW
+    default-authentication-plugin=mysql_native_password
+    EOF
+      
+      # Script para criar usuário de replicação no master
+      cat <<EOF > /mnt/initdb/01-create-replication-user.sql
+    CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replpass';
+    GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+    FLUSH PRIVILEGES;
+    EOF
+    else
+      ID=$(echo $HOSTNAME | awk -F'-' '{print $2}')
+      echo "SLAVE" > /mnt/conf/role
+      cat <<EOF > /mnt/conf/slave.cnf
+    [mysqld]
+    server-id=$((100 + ID))
+    relay-log=relay-bin
+    log-bin=mysql-bin
+    binlog-format=ROW
+    default-authentication-plugin=mysql_native_password
+    read-only=1
+    EOF
+      
+    fi
+  replication-configurer.sh: |
+    #!/bin/sh
+    set -eu
+    ROOT_PASS="${MYSQL_ROOT_PASSWORD:-rootpass}"
+    MASTER_HOST="mysql-0.mysql-headless"
+    REPL_USER="repl"
+    REPL_PASS="replpass"
+    POD_HOSTNAME="$(cat /etc/hostname 2>/dev/null || echo unknown)"
+    echo "[replication-configurer] Start em ${POD_HOSTNAME}"
+    if [ "${POD_HOSTNAME}" = "mysql-0" ]; then
+      echo "[replication-configurer] Sou master, dormindo infinito"; sleep infinity; fi
+    echo "[replication-configurer] Aguardando mysqld local ficar pronto";
+    ATT=0; until mysql --protocol=TCP -h 127.0.0.1 -u root -p"$ROOT_PASS" -e 'SELECT 1' >/dev/null 2>&1; do
+      sleep 3; ATT=$((ATT+1)); if [ $ATT -gt 120 ]; then echo "[replication-configurer] Timeout mysqld local"; fi
+    done
+    if mysql -u root -p"$ROOT_PASS" -e 'SHOW SLAVE STATUS\G' 2>/dev/null | grep -q 'Slave_IO_Running: Yes'; then
+      echo "[replication-configurer] Já configurado"; sleep infinity; fi
+    echo "[replication-configurer] Aguardando master";
+    # Espera adicional para garantir criação do usuário de replicação
+    ATT=0; until mysql --protocol=TCP -h "$MASTER_HOST" -u root -p"$ROOT_PASS" -e "SELECT User FROM mysql.user WHERE User='${REPL_USER}'" 2>/dev/null | grep -q "${REPL_USER}"; do
+      sleep 5; ATT=$((ATT+1)); if [ $ATT -gt 120 ]; then echo "[replication-configurer] Timeout aguardando master (user repl)"; break; fi; done
+    MS=$(mysql --protocol=TCP -h "$MASTER_HOST" -u root -p"$ROOT_PASS" -e 'SHOW MASTER STATUS\G' || true)
+    FILE=$(echo "$MS" | awk -F': ' '/File:/{print $2}')
+    POS=$(echo "$MS" | awk -F': ' '/Position:/{print $2}')
+    if [ -z "$FILE" ] || [ -z "$POS" ]; then echo "[replication-configurer] Falha obtendo status"; sleep 30; fi
+    echo "[replication-configurer] Configurando -> $FILE:$POS"
+    mysql --protocol=TCP -u root -p"$ROOT_PASS" -e "STOP SLAVE; RESET SLAVE ALL; CHANGE MASTER TO MASTER_HOST='${MASTER_HOST}', MASTER_USER='${REPL_USER}', MASTER_PASSWORD='${REPL_PASS}', MASTER_LOG_FILE='${FILE}', MASTER_LOG_POS=${POS}, GET_MASTER_PUBLIC_KEY=1; START SLAVE;" || echo "[replication-configurer] Erro ao aplicar CHANGE MASTER"
+    echo "[replication-configurer] Validando replicação";
+    TRY=0; OK=0; while [ $TRY -lt 30 ]; do
+      OUT=$(mysql -u root -p"$ROOT_PASS" -e 'SHOW SLAVE STATUS\\G' 2>/dev/null || true)
+      echo "$OUT" | grep -q 'Slave_IO_Running: Yes' && echo "$OUT" | grep -q 'Slave_SQL_Running: Yes' && OK=1 && break
+      sleep 4; TRY=$((TRY+1));
+    done
+    if [ $OK -eq 1 ]; then
+      echo "[replication-configurer] Replicação ATIVA";
+    else
+      echo "[replication-configurer] Replicação NÃO ativa após tentativas";
+    fi
+    sleep infinity
+    
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless
+  labels:
+    app: mysql
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-master
+  labels:
+    app: mysql
+    role: master
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: mysql-0
+  ports:
+    - name: mysql
+      port: 3306
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-slave
+  labels:
+    app: mysql
+    role: slave
+spec:
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      initContainers:
+        - name: init-mysql-role
+          image: busybox:1.36
+          command: ["sh", "/mnt/scripts/init-mysql.sh"]
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /mnt/scripts
+            - name: conf
+              mountPath: /mnt/conf
+            - name: initdb
+              mountPath: /mnt/initdb
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - containerPort: 3306
+              name: mysql
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: rootpass
+            - name: MYSQL_DATABASE
+              value: mydb
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+              subPath: .
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              subPath: .
+        - name: replication-sidecar
+          image: mysql:8.0
+          command: ["sh", "/scripts/replication-configurer.sh"]
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: rootpass
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /scripts
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: mysql-init-scripts
+        - name: conf
+          emptyDir: {}
+        - name: initdb
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+

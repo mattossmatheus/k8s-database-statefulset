@@ -1,0 +1,88 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongodb-init-replica
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: mongodb-init
+        image: mongo:7.0
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Aguardando MongoDB master estar pronto..."
+          
+          # Aguardar MongoDB estar respondendo
+          ATT=0
+          until mongosh --quiet --eval "db.runCommand('ping')" mongodb://mongodb-0.mongodb-headless:27017/admin >/dev/null 2>&1; do
+            sleep 10
+            ATT=$((ATT+1))
+            if [ $ATT -gt 60 ]; then
+              echo "ERRO: MongoDB não respondeu em 10 minutos"
+              exit 1
+            fi
+            echo "Aguardando MongoDB master... (tentativa=$ATT/60)"
+          done
+          
+          # Aguardar outros pods estarem prontos
+          echo "Aguardando outros pods estarem prontos..."
+          
+          ATT1=0
+          until mongosh --quiet --eval "db.runCommand('ping')" mongodb://mongodb-1.mongodb-headless:27017/admin >/dev/null 2>&1; do
+            sleep 10
+            ATT1=$((ATT1+1))
+            if [ $ATT1 -gt 60 ]; then
+              echo "ERRO: MongoDB-1 não respondeu em 10 minutos"
+              exit 1
+            fi
+            echo "Aguardando MongoDB-1... (tentativa=$ATT1/60)"
+          done
+          
+          ATT2=0
+          until mongosh --quiet --eval "db.runCommand('ping')" mongodb://mongodb-2.mongodb-headless:27017/admin >/dev/null 2>&1; do
+            sleep 10
+            ATT2=$((ATT2+1))
+            if [ $ATT2 -gt 60 ]; then
+              echo "ERRO: MongoDB-2 não respondeu em 10 minutos"
+              exit 1
+            fi
+            echo "Aguardando MongoDB-2... (tentativa=$ATT2/60)"
+          done
+          
+          # Aguardar mais um pouco para estabilização
+          echo "Aguardando estabilização dos pods..."
+          sleep 30
+          
+          # Verificar se replica set já está configurado
+          echo "Verificando se replica set já está configurado..."
+          if mongosh --quiet --eval "rs.status().ok" mongodb://mongodb-0.mongodb-headless:27017/admin 2>/dev/null | grep -q "1"; then
+            echo "Replica Set já configurado"
+            mongosh --eval "rs.status()" mongodb://mongodb-0.mongodb-headless:27017/admin | grep -E "(stateStr|name.*mongodb)"
+            exit 0
+          fi
+          
+          echo "Configurando Replica Set automaticamente..."
+          
+          # Configurar replica set
+          mongosh --eval "
+          rs.initiate({
+            _id: 'rs0',
+            members: [
+              { _id: 0, host: 'mongodb-0.mongodb-headless:27017', priority: 2 },
+              { _id: 1, host: 'mongodb-1.mongodb-headless:27017', priority: 1 },
+              { _id: 2, host: 'mongodb-2.mongodb-headless:27017', priority: 1 }
+            ]
+          })
+          " mongodb://mongodb-0.mongodb-headless:27017/admin
+          
+          echo "Replica Set configurado!"
+          
+          # Aguardar configuração se propagar
+          sleep 30
+          
+          echo "Verificação final do status:"
+          mongosh --eval "rs.status()" mongodb://mongodb-0.mongodb-headless:27017/admin | grep -E "(stateStr|name.*mongodb)"

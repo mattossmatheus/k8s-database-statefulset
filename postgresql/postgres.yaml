@@ -1,0 +1,298 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-scripts
+data:
+  init-pg.sh: |
+    #!/bin/sh
+    set -eu
+    HOSTNAME=$(cat /etc/hostname)
+    ORDINAL=$(echo "$HOSTNAME" | awk -F'-' '{print $2}')
+    echo "[init-pg] Host=$HOSTNAME Ordinal=$ORDINAL"
+    
+    # Criar diretório com permissões corretas
+    mkdir -p /mnt/initdb
+    chmod 755 /mnt/initdb
+    
+    if [ "$ORDINAL" = "0" ]; then
+      echo "[init-pg] Configurando PRIMARY (Master)"
+      
+      # Criar usuário de replicação
+      cat > /mnt/initdb/01-repl-user.sql << 'EOFUSER'
+    CREATE ROLE repl WITH REPLICATION LOGIN PASSWORD 'replpass';
+    EOFUSER
+      
+      # Script de configuração do master
+      cat > /mnt/initdb/02-master-config.sh << 'EOFCONFIG'
+    #!/bin/sh
+    set -eu
+    echo "[config] Configurando PostgreSQL Master"
+
+    # Configurações de conexão
+    echo "listen_addresses='*'" >> "$PGDATA/postgresql.conf"
+    echo "port=5432" >> "$PGDATA/postgresql.conf"
+    echo "max_connections=200" >> "$PGDATA/postgresql.conf"
+
+    # Configurações de WAL e Replicação
+    echo "wal_level=replica" >> "$PGDATA/postgresql.conf"
+    echo "max_wal_senders=10" >> "$PGDATA/postgresql.conf"
+    echo "max_replication_slots=10" >> "$PGDATA/postgresql.conf"
+    echo "wal_keep_size=512MB" >> "$PGDATA/postgresql.conf"
+    echo "hot_standby=on" >> "$PGDATA/postgresql.conf"
+    echo "hot_standby_feedback=on" >> "$PGDATA/postgresql.conf"
+
+    # Configurações de performance
+    echo "shared_buffers=128MB" >> "$PGDATA/postgresql.conf"
+    echo "effective_cache_size=256MB" >> "$PGDATA/postgresql.conf"
+    echo "maintenance_work_mem=32MB" >> "$PGDATA/postgresql.conf"
+    echo "checkpoint_completion_target=0.9" >> "$PGDATA/postgresql.conf"
+    echo "wal_buffers=16MB" >> "$PGDATA/postgresql.conf"
+    echo "default_statistics_target=100" >> "$PGDATA/postgresql.conf"
+
+    # Configurações de logging
+    echo "log_destination='stderr'" >> "$PGDATA/postgresql.conf"
+    echo "logging_collector=on" >> "$PGDATA/postgresql.conf"
+    echo "log_min_messages=warning" >> "$PGDATA/postgresql.conf"
+    echo "log_line_prefix='%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '" >> "$PGDATA/postgresql.conf"
+    echo "log_checkpoints=on" >> "$PGDATA/postgresql.conf"
+    echo "log_connections=on" >> "$PGDATA/postgresql.conf"
+    echo "log_disconnections=on" >> "$PGDATA/postgresql.conf"
+    echo "log_lock_waits=on" >> "$PGDATA/postgresql.conf"
+
+    # Configurações de autenticação
+    echo "# Replication connections" >> "$PGDATA/pg_hba.conf"
+    echo "host replication repl all md5" >> "$PGDATA/pg_hba.conf"
+
+    echo "[config] Master configurado com sucesso"
+    EOFCONFIG
+      chmod +x /mnt/initdb/02-master-config.sh
+    else
+      echo "[init-pg] Configurando REPLICA (Slave $ORDINAL)"
+    fi
+
+  basebackup.sh: |
+    #!/bin/sh
+    set -eu
+    HOSTNAME=$(cat /etc/hostname)
+    ORDINAL=$(echo "$HOSTNAME" | awk -F'-' '{print $2}')
+    
+    if [ "$ORDINAL" = "0" ]; then
+      echo "[basebackup] Sou PRIMARY (Master), saindo"
+      exit 0
+    fi
+    
+    echo "[basebackup] Iniciando REPLICA $ORDINAL para $HOSTNAME"
+    
+    # Verificar se já está inicializado
+    if [ -f /var/lib/postgresql/data/PG_VERSION ]; then
+      echo "[basebackup] Replica já inicializada, verificando se está atualizada"
+      # Aqui poderia verificar se precisa de resync, mas por simplicidade, vamos continuar
+      exit 0
+    fi
+    
+    echo "[basebackup] Aguardando PRIMARY estar disponível para replicação"
+    ATT=0
+    until PGPASSWORD="replpass" pg_isready -h postgres-0.postgres-headless -p 5432 -U repl >/dev/null 2>&1; do
+      sleep 5
+      ATT=$((ATT+1))
+      if [ $ATT -gt 120 ]; then
+        echo "[basebackup] ERRO: Timeout aguardando PRIMARY (10 minutos)"
+        exit 1
+      fi
+      echo "[basebackup] Aguardando PRIMARY... (tentativa=$ATT/120)"
+    done
+    
+    # Aguardar o master estar completamente inicializado
+    echo "[basebackup] PRIMARY detectado, aguardando inicialização completa..."
+    sleep 30
+    
+    # Verificar se conseguimos conectar para replicação
+    echo "[basebackup] Testando conexão de replicação..."
+    ATT=0
+    until PGPASSWORD="replpass" psql -h postgres-0.postgres-headless -U repl -d postgres -c "SELECT 1;" >/dev/null 2>&1; do
+      sleep 10
+      ATT=$((ATT+1))
+      if [ $ATT -gt 30 ]; then
+        echo "[basebackup] ERRO: Não conseguiu conectar para replicação"
+        exit 1
+      fi
+      echo "[basebackup] Testando replicação... (tentativa=$ATT/30)"
+    done
+    
+    export PGPASSWORD="replpass"
+    echo "[basebackup] Iniciando pg_basebackup para REPLICA $ORDINAL..."
+    
+    # Limpar diretório se existir
+    rm -rf /var/lib/postgresql/data/*
+    
+    # Executar basebackup com configurações otimizadas
+    pg_basebackup \
+      -h postgres-0.postgres-headless \
+      -D /var/lib/postgresql/data \
+      -U repl \
+      -Fp \
+      -Xs \
+      -P \
+      -R \
+      -W \
+      --checkpoint=fast \
+      -v
+    
+    # Configurações específicas da replica
+    cat >> /var/lib/postgresql/data/postgresql.conf << 'EOFREPLICA'
+
+    # Configurações específicas da REPLICA
+    hot_standby=on
+    max_connections=200
+    hot_standby_feedback=on
+    wal_receiver_status_interval=2s
+    max_standby_streaming_delay=30s
+    max_standby_archive_delay=30s
+    EOFREPLICA
+    
+    echo "[basebackup] REPLICA $ORDINAL configurada com sucesso"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  labels:
+    app: postgres
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  labels:
+    app: postgres
+    role: primary
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: postgres-0
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replicas
+  labels:
+    app: postgres
+    role: replica
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+  # NOTA: Este Service atualmente roteará para TODOS os pods.
+  # Para usar apenas réplicas, conecte diretamente:
+  # postgres-1.postgres-headless ou postgres-2.postgres-headless
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      initContainers:
+        - name: init-pg-primary
+          image: busybox:1.36
+          securityContext:
+            runAsUser: 0
+          command: ["sh", "/mnt/scripts/init-pg.sh"]
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /mnt/scripts
+            - name: initdb
+              mountPath: /mnt/initdb
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+        - name: init-pg-basebackup
+          image: postgres:15
+          env:
+            - name: PGUSER
+              value: repl
+            - name: PGPASSWORD
+              value: replpass
+          command: ["sh", "/mnt/scripts/basebackup.sh"]
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /mnt/scripts
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: postgres:15
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_PASSWORD
+              value: rootpass
+            - name: POSTGRES_USER
+              value: root
+            - name: POSTGRES_DB
+              value: postgres
+            - name: PGDATA
+              value: /var/lib/postgresql/data
+            - name: POSTGRES_INITDB_ARGS
+              value: "--auth-host=md5"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: init-scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - pg_ctl stop -D /var/lib/postgresql/data -w -t 60 -m fast
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgres-init-scripts
+            defaultMode: 0755
+        - name: initdb
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path  # StorageClass padrão do K3s
+        resources:
+          requests:
+            storage: 10Gi

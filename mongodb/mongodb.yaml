@@ -1,0 +1,273 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-init-scripts
+data:
+  init-mongo.sh: |
+    #!/bin/sh
+    set -eu
+    HOSTNAME=$(cat /etc/hostname)
+    ORDINAL=$(echo "$HOSTNAME" | awk -F'-' '{print $2}')
+    echo "[init-mongo] Host=$HOSTNAME Ordinal=$ORDINAL"
+    
+    # Criar diretório com permissões corretas
+    mkdir -p /mnt/initdb
+    chmod 755 /mnt/initdb
+    
+    if [ "$ORDINAL" = "0" ]; then
+      echo "[init-mongo] Configurando PRIMARY (Master)"
+      
+      # Script de inicialização do master
+      cat > /mnt/initdb/init-replica.js << 'EOFINIT'
+    rs.initiate({
+      _id: "rs0",
+      members: [
+        { _id: 0, host: "mongodb-0.mongodb-headless:27017", priority: 2 },
+        { _id: 1, host: "mongodb-1.mongodb-headless:27017", priority: 1 },
+        { _id: 2, host: "mongodb-2.mongodb-headless:27017", priority: 1 }
+      ]
+    });
+    EOFINIT
+    else
+      echo "[init-mongo] Configurando REPLICA (Slave $ORDINAL)"
+      
+      # Para réplicas, só criar um arquivo indicativo
+      touch /mnt/initdb/replica-marker
+      echo "[init-mongo] Replica $ORDINAL configurada para aguardar o Primary"
+    fi
+
+  auto-config-replica.sh: |
+    #!/bin/sh
+    set -e
+    HOSTNAME=$(cat /etc/hostname)
+    ORDINAL=$(echo "$HOSTNAME" | awk -F'-' '{print $2}')
+    
+    if [ "$ORDINAL" != "0" ]; then
+      echo "[auto-config] Sou REPLICA, saindo"
+      exit 0
+    fi
+    
+    echo "[auto-config] Aguardando MongoDB master estar pronto..."
+    
+    # Aguardar MongoDB estar respondendo
+    ATT=0
+    until mongosh --quiet --eval "db.runCommand('ping')" >/dev/null 2>&1; do
+      sleep 5
+      ATT=$((ATT+1))
+      if [ $ATT -gt 60 ]; then
+        echo "[auto-config] ERRO: MongoDB não respondeu em 5 minutos"
+        exit 1
+      fi
+      echo "[auto-config] Aguardando MongoDB... (tentativa=$ATT/60)"
+    done
+    
+    # Verificar se replica set já está configurado
+    if mongosh --quiet --eval "try { rs.status(); print('CONFIGURED'); } catch(e) { print('NOT_CONFIGURED'); }" | grep -q "CONFIGURED"; then
+      echo "[auto-config] Replica Set já configurado"
+      exit 0
+    fi
+    
+    echo "[auto-config] Configurando Replica Set..."
+    
+    # Aguardar outros pods estarem prontos
+    echo "[auto-config] Aguardando outros pods estarem prontos..."
+    sleep 60  # Dar tempo para pods inicializarem
+    
+    ATT=0
+    until wget -q --spider --timeout=3 --tries=1 http://mongodb-1.mongodb-headless:27017 2>/dev/null && wget -q --spider --timeout=3 --tries=1 http://mongodb-2.mongodb-headless:27017 2>/dev/null; do
+      sleep 10
+      ATT=$((ATT+1))
+      if [ $ATT -gt 20 ]; then
+        echo "[auto-config] AVISO: Nem todos os pods estão prontos, configurando apenas o master"
+        break
+      fi
+      echo "[auto-config] Aguardando todos os pods... (tentativa=$ATT/20)"
+    done
+    
+    # Executar configuração do replica set
+    if [ -f /docker-entrypoint-initdb.d/init-replica.js ]; then
+      echo "[auto-config] Executando configuração do replica set..."
+      mongosh --file /docker-entrypoint-initdb.d/init-replica.js
+      echo "[auto-config] Replica Set configurado com sucesso!"
+    else
+      echo "[auto-config] Arquivo de configuração não encontrado, configurando manualmente..."
+      mongosh --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb-0.mongodb-headless:27017', priority: 2}, {_id: 1, host: 'mongodb-1.mongodb-headless:27017', priority: 1}, {_id: 2, host: 'mongodb-2.mongodb-headless:27017', priority: 1}]})"
+    fi
+    
+    echo "[auto-config] Configuração automática concluída!"
+
+  wait-primary.sh: |
+    #!/bin/sh
+    set -eu
+    HOSTNAME=$(cat /etc/hostname)
+    ORDINAL=$(echo "$HOSTNAME" | awk -F'-' '{print $2}')
+    
+    if [ "$ORDINAL" = "0" ]; then
+      echo "[wait-primary] Sou PRIMARY (Master), saindo"
+      exit 0
+    fi
+    
+    echo "[wait-primary] REPLICA $ORDINAL aguardando PRIMARY mongodb-0..."
+    
+    # Aguardar usando wget/ping básico
+    ATT=0
+    until wget -q --spider --timeout=5 --tries=1 http://mongodb-0.mongodb-headless:27017 2>/dev/null || [ $ATT -gt 60 ]; do
+      sleep 10
+      ATT=$((ATT+1))
+      echo "[wait-primary] Aguardando PRIMARY... (tentativa=$ATT/60)"
+    done
+    
+    if [ $ATT -gt 60 ]; then
+      echo "[wait-primary] AVISO: Timeout, mas continuando..."
+    fi
+    
+    echo "[wait-primary] Aguardando inicialização completa do PRIMARY..."
+    sleep 90  # Dar tempo suficiente para MongoDB inicializar
+    
+    echo "[wait-primary] REPLICA $ORDINAL pronta para iniciar"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless
+  labels:
+    app: mongodb
+spec:
+  clusterIP: None
+  selector:
+    app: mongodb
+  ports:
+    - name: mongodb
+      port: 27017
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-primary
+  labels:
+    app: mongodb
+    role: primary
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: mongodb-0
+  ports:
+    - name: mongodb
+      port: 27017
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-replicas
+  labels:
+    app: mongodb
+    role: replica
+spec:
+  selector:
+    app: mongodb
+  ports:
+    - name: mongodb
+      port: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+spec:
+  serviceName: mongodb-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: init-mongo-primary
+          image: busybox:1.36
+          securityContext:
+            runAsUser: 0
+          command: ["sh", "/mnt/scripts/init-mongo.sh"]
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /mnt/scripts
+            - name: initdb
+              mountPath: /mnt/initdb
+        - name: wait-primary
+          image: busybox:1.36
+          command: ["sh", "/mnt/scripts/wait-primary.sh"]
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /mnt/scripts
+      containers:
+        - name: mongodb
+          image: mongo:7.0
+          ports:
+            - containerPort: 27017
+              name: mongodb
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              value: admin
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              value: adminpass
+          command:
+            - mongod
+            - --bind_ip_all
+            - --replSet
+            - rs0
+          volumeMounts:
+            - name: mongodb-data
+              mountPath: /data/db
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+            - name: init-scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - mongosh --eval "db.adminCommand('shutdown')" mongodb://localhost:27017/admin || true
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - /scripts/auto-config-replica.sh &
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: mongodb-init-scripts
+            defaultMode: 0755
+        - name: initdb
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: mongodb-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-keyfile
+type: Opaque
+data:
+  keyfile: bW9uZ29kYmtleWZpbGVmb3JhdXRoZW50aWNhdGlvbmJldHdlZW5tZW1iZXJzb2ZyZXBsaWNhc2V0dGhpc2lzYXZlcnlsb25nc3RyaW5ndGhhdHNob3VsZGJlcmFuZG9tYW5kc2VjdXJlZm9ycHJvZHVjdGlvbnVzZWdlbmVyYXRlYW5ld29uZXdpdGhvcGVuc3NscmFuZGNvbW1hbmQ=
